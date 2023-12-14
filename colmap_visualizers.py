@@ -1,5 +1,5 @@
 import open3d as o3d
-from read_write_model import read_model
+from read_write_model import read_model, BaseImage
 import os
 import numpy as np
 from torch.utils.data import Dataset
@@ -9,6 +9,54 @@ import matplotlib.pyplot as plt
 import json
 import depth_estimator as de
 import cv2
+
+from hovering.o3d_line_mesh import LineMesh
+
+EPIC_WIDTH = 456
+EPIC_HEIGHT = 256
+
+FRUSTUM_SIZE = 0.6
+FRUSTUM_LINE_RADIUS = 0.02
+
+TRAJECTORY_LINE_RADIUS = 0.02
+def get_frustum(sz=1.0, 
+                line_radius=0.15,
+                colmap_image: BaseImage = None, 
+                camera_height=None,
+                camera_width=None,
+                frustum_color=[1, 0, 0]) -> o3d.geometry.TriangleMesh:
+    """
+    Args:
+        sz: float, size (width) of the frustum
+        colmap_image: ColmapImage, if not None, the frustum will be transformed
+            otherwise the frustum will "lookAt" +z direction
+    """
+    cen = [0, 0, 0]
+    wid = sz
+    if camera_height is not None and camera_width is not None:
+        hei = wid * camera_height / camera_width
+    else:
+        hei = wid
+    tl = [wid, hei, sz]
+    tr = [-wid, hei, sz]
+    br = [-wid, -hei, sz]
+    bl = [wid, -hei, sz]
+    points = np.float32([cen, tl, tr, br, bl])
+    lines = [
+        [0, 1], [0, 2], [0, 3], [0, 4],
+        [1, 2], [2, 3], [3, 4], [4, 1],]
+    line_mesh = LineMesh(
+        points, lines, colors=frustum_color, radius=line_radius)
+    line_mesh.merge_cylinder_segments()
+    frustum = line_mesh.cylinder_segments[0]
+
+    if colmap_image is not None:
+        w2c = np.eye(4)
+        w2c[:3, :3] = colmap_image.qvec2rotmat()
+        w2c[:3, -1] = colmap_image.tvec
+        c2w = np.linalg.inv(w2c)
+        frustum = frustum.transform(c2w)
+    return frustum
 
 def get_o3d_FOR(origin=[0, 0, 0],size=10):
     """ 
@@ -245,39 +293,7 @@ class COLMAP(Dataset):
         #path_ply = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/DenseReconstruction/P01_01/fused.ply"
         #pcd_ply = pcd = o3d.io.read_point_cloud(path_ply)
         #o3d.visualization.draw_geometries([pcd])
-    '''
-    def get_depths(self):
-        all_abs_depth, all_abs_colors, cameras, all_keypoints, all_rgb_keypoints = [], [], [], [], []
-        for i,k in enumerate(self.imgs_Colmap.keys()):
-            v = self.imgs_Colmap[k]
-            colmap_depths = np.array([(v.qvec2rotmat() @ self.dataset.pts_Colmap[p3d].xyz + v.tvec)[2] for p3d in v.point3D_ids[v.point3D_ids > -1]]) #WE PASS TO CAMERA COORDINATES
-            colmap_coords = np.array([v.xys[np.where(v.point3D_ids == p3d)][0, ::-1] for p3d in v.point3D_ids[v.point3D_ids > -1]]) #Depth of the keypoints in the camera coordinates
-            colmap_keypoints = np.array([self.dataset.pts_Colmap[p3d].xyz for p3d in v.point3D_ids[v.point3D_ids > -1]]) #Absolute coordinates
-            colmap_rgb = np.array([self.dataset.pts_Colmap[p3d].rgb for p3d in v.point3D_ids[v.point3D_ids > -1]]) #Absolute coordinates
-            colmap_rgb = self.alpha * colmap_rgb + (1 - self.alpha) * 255
-            all_keypoints.append(colmap_keypoints)
-            all_rgb_keypoints.append(colmap_rgb)
-            #Extract depth from current frame
-            depth = self.depth_extractor(frame_dict[('color', 0)], frame_dict['filename']) #Depth map in image coordinates (Relative!!)
-            local_scale = self.new_scale_SfM_depth(depth, colmap_depths, colmap_coords)
-            rescaled_rgbd = self.obtain_rgbd(depth, local_scale)
-
-    def get_single_depth(self,idx):
-        all_abs_depth, all_abs_colors, cameras, all_keypoints, all_rgb_keypoints = [], [], [], [], []
-        
-        v = self.imgs_Colmap[idx]
-        colmap_depths = np.array([(v.qvec2rotmat() @ self.dataset.pts_Colmap[p3d].xyz + v.tvec)[2] for p3d in v.point3D_ids[v.point3D_ids > -1]]) #WE PASS TO CAMERA COORDINATES
-        colmap_coords = np.array([v.xys[np.where(v.point3D_ids == p3d)][0, ::-1] for p3d in v.point3D_ids[v.point3D_ids > -1]]) #Depth of the keypoints in the camera coordinates
-        colmap_keypoints = np.array([self.dataset.pts_Colmap[p3d].xyz for p3d in v.point3D_ids[v.point3D_ids > -1]]) #Absolute coordinates
-        colmap_rgb = np.array([self.dataset.pts_Colmap[p3d].rgb for p3d in v.point3D_ids[v.point3D_ids > -1]]) #Absolute coordinates
-        colmap_rgb = self.alpha * colmap_rgb + (1 - self.alpha) * 255
-        all_keypoints.append(colmap_keypoints)
-        all_rgb_keypoints.append(colmap_rgb)
-        #Extract depth from current frame
-        depth = self.depth_extractor(frame_dict[('color', 0)], frame_dict['filename']) #Depth map in image coordinates (Relative!!)
-        local_scale = self.new_scale_SfM_depth(depth, colmap_depths, colmap_coords)
-        rescaled_rgbd = self.obtain_rgbd(depth, local_scale)
-    '''
+  
 
 class motion_estimator():
     def __init__(self,root_data,path_col,path_diff,vid) -> None:
@@ -286,8 +302,8 @@ class motion_estimator():
         self.c = COLMAP(path_col)
         self.epic_diff = EPICDiff(vid,path_diff)
         self.depth_est = de.Inference()
-        self.width = 498
-        self.height = 456
+        self.width = 456
+        self.height = 256
     
     def new_scale_SfM_depth(self, depth, colmap_depths, colmap_coords):
         SfM_depth, NN_depth = [], []
@@ -324,6 +340,24 @@ class motion_estimator():
         points_w[:,1] = points_w[:,1] + camera_origin[1]
         points_w[:,2] = points_w[:,2] + camera_origin[2]
         return points_w
+    def obtain_rgbd2(self, depth, scale,camera_origin,extrinsic_cam):
+        offset = 1.5 / 2700
+        z = (depth+offset) * scale
+        x = (np.tile(np.arange(self.width), (self.height, 1)) - self.c.cx) * z / self.c.fx
+        y = (np.tile(np.arange(self.height), (self.width, 1)).T - self.c.cy) * z / self.c.fy
+        #points = np.stack([x, y, z], axis=2) #h, w, 3
+
+        x = x.reshape((self.width*self.height,1)) 
+        y = y.reshape((self.width*self.height,1)) 
+        z = z.reshape((self.width*self.height,1)) 
+        points =np.concatenate([x,y,z], axis=1)
+
+        w2c = np.eye(4)
+        w2c[:3, :3] = extrinsic_cam
+        w2c[:3, -1] = camera_origin
+        c2w = np.linalg.inv(w2c)
+        
+        return points, c2w
     
     def extract_pcd_by_indx(self,idx):
         #Get Image Depth
@@ -342,8 +376,8 @@ class motion_estimator():
         colmap_rgb = np.array([self.c.pts_Colmap[p3d].rgb for p3d in v.point3D_ids[v.point3D_ids > -1]]) #Absolute coordinates
 
         local_scale = self.new_scale_SfM_depth(depth, colmap_depths, colmap_coords)
-        rescaled_rgbd = self.obtain_rgbd(depth, local_scale,v.tvec,v.qvec2rotmat())
-        return rescaled_rgbd, colmap_keypoints,colmap_rgb
+        rescaled_rgbd,c2w = self.obtain_rgbd2(depth, local_scale,v.tvec,v.qvec2rotmat())
+        return rescaled_rgbd, colmap_keypoints,colmap_rgb,c2w
     
     def draw_pcd(self,points,color=False):
         pcd = o3d.geometry.PointCloud()
@@ -365,21 +399,32 @@ class motion_estimator():
         pcd2.colors = o3d.utility.Vector3dVector(p2_color)
 
         o3d.visualization.draw_geometries([pcd,pcd2])
-path = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELDS/example_data/P01_01"
+
+    def get_frustum(self,idx):
+        c_idx = [self.c.imgs_Colmap[i].id for i in self.c.imgs_Colmap.keys() if self.c.imgs_Colmap[i].name == self.epic_diff.image_paths[idx]]
+        #Get corresponding colmap depth
+        test_img = self.c.imgs_Colmap[c_idx[0]]
+        frustum = get_frustum(
+            sz=FRUSTUM_SIZE, line_radius=FRUSTUM_LINE_RADIUS,
+            colmap_image=test_img,
+            camera_height=EPIC_HEIGHT, camera_width=EPIC_WIDTH)
+        return frustum
+path  = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELDS/example_data/P01_01"
 
 root_data = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELDS/depth_extractor/data/Epic_converted"
 #c = COLMAP(path)
 vid = "P01_01"
 path_diff = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELDS/depth_extractor/data/Epic_converted"
 me = motion_estimator(root_data,path,path_diff,vid)
-
-pcd_50, col_50_xyz,col_50_rgb = me.extract_pcd_by_indx(785) #120 285 730 785
-p2_color = np.tile(np.array([0,0,1]),(col_50_xyz.shape[0],1))
+idx = 285
+pcd_50, col_50_xyz,col_50_rgb,c2w = me.extract_pcd_by_indx(idx) #120 285 730 785
+p2_color = np.tile(np.array([0,0,1]),(col_50_xyz.shape[0],1)) #BLUE Color
 #me.compare_pcds(pcd_50,col_50_xyz,p2_color)
 
+##################################################################################################
 #compare with all the pointcloud
-colmap_pcd_xyz = np.array([me.c.pts_Colmap[p3d].xyz for p3d in me.c.pts_Colmap.keys()])
-colmap_pcd_rgb = np.array([me.c.pts_Colmap[p3d].rgb for p3d in me.c.pts_Colmap.keys()])
+#colmap_pcd_xyz = np.array([me.c.pts_Colmap[p3d].xyz for p3d in me.c.pts_Colmap.keys()])
+#colmap_pcd_rgb = np.array([me.c.pts_Colmap[p3d].rgb for p3d in me.c.pts_Colmap.keys()])
 
 path = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/DenseReconstruction/P01_01/fused.ply"
 pcd2 = o3d.io.read_point_cloud(path)
@@ -389,9 +434,11 @@ pcd = o3d.geometry.PointCloud()
 pcd.points = o3d.utility.Vector3dVector(p1)
 red = np.tile(np.array([1,0,0]),(p1.shape[0],1))
 pcd.colors = o3d.utility.Vector3dVector(red)
+pcd = pcd.transform(c2w)
 
-o3d.visualization.draw_geometries([pcd,pcd2])
+FOR =  get_o3d_FOR()
+frustum = me.get_frustum(idx)
+o3d.visualization.draw_geometries([pcd,pcd2,FOR,frustum])
 
-me.compare_pcds(p1,colmap_pcd_xyz,p2_color)
-#c.draw_pcd_from_image(5310)
+
 print("Ciao")
