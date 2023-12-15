@@ -79,6 +79,25 @@ def load_meta(root, name="meta.json"):
     ds["intrinsics"] = np.array(ds["intrinsics"])
     return ds
 
+def convert_camera2world(points,R,t):
+    # R, t are relative to world to camera
+    w2c = np.eye(4)
+    w2c[:3,:3] = R
+    w2c[:3,3] = t
+
+    c2w = np.linalg.inv(w2c)
+
+    #pass to homogeneous coords
+    len_p = points.shape[0]
+    points_h = np.concatenate((points,np.ones((len_p,1))),axis=-1)
+
+    #camera to world
+    points_world = np.dot(c2w, points_h.T).T
+    points_world = points_world[:, :3] / points_world[:, 3][:, None]
+    
+    return points_world  
+
+
 class EPICDiff(Dataset):
     def __init__(self, vid, root="data/EPIC-Diff", split=None):
 
@@ -233,16 +252,20 @@ class EPICDiff(Dataset):
 class COLMAP(Dataset):
     """Superclass for sequential images dataloaders
     """
-    def __init__(self, data_path):
+    def __init__(self, data_path,input_res=[456,256],output_res=[228,128]):
         super(COLMAP, self).__init__()
         #self.colmap_poses = os.path.join(data_path, kitchen,'colmap')
         self.colmap_path = data_path
         
         self.cameras_Colmap, self.imgs_Colmap, self.pts_Colmap = read_model(self.colmap_path, ext=".bin")
-        self.fx = self.cameras_Colmap[1].params[0]
-        self.fy = self.cameras_Colmap[1].params[1]
-        self.cx = self.cameras_Colmap[1].params[2]
-        self.cy = self.cameras_Colmap[1].params[3]
+        self.fx_orig = self.cameras_Colmap[1].params[0]
+        self.fy_orig = self.cameras_Colmap[1].params[1]
+        self.fx = self.fx_orig*output_res[0]/input_res[0]
+        self.fy = self.fy_orig*output_res[1]/input_res[1]
+        self.cx_orig = self.cameras_Colmap[1].params[2]
+        self.cy_orig = self.cameras_Colmap[1].params[3]
+        self.cx = self.cx_orig*output_res[0]/input_res[0]
+        self.cy = self.cy_orig*output_res[1]/input_res[1]
         
 
 
@@ -299,11 +322,11 @@ class motion_estimator():
     def __init__(self,root_data,path_col,path_diff,vid) -> None:
         self.root_data = root_data
         self.vid = vid
-        self.c = COLMAP(path_col)
+        self.c = COLMAP(path_col)#,output_res=[456,256])
         self.epic_diff = EPICDiff(vid,path_diff)
         self.depth_est = de.Inference()
-        self.width = 456
-        self.height = 256
+        self.width = 228
+        self.height = 128
     
     def new_scale_SfM_depth(self, depth, colmap_depths, colmap_coords):
         SfM_depth, NN_depth = [], []
@@ -335,13 +358,10 @@ class motion_estimator():
         z = z.reshape((self.width*self.height,1)) 
         points =np.concatenate([x,y,z], axis=1)
 
-        points_w = points @ extrinsic_cam
-        points_w[:,0] = points_w[:,0] + camera_origin[0]
-        points_w[:,1] = points_w[:,1] + camera_origin[1]
-        points_w[:,2] = points_w[:,2] + camera_origin[2]
+        points_w = convert_camera2world(points,extrinsic_cam,camera_origin)
         return points_w
     def obtain_rgbd2(self, depth, scale,camera_origin,extrinsic_cam):
-        offset = 1.5 / 2700
+        offset = 0#1.5 / 2700
         z = (depth+offset) * scale
         x = (np.tile(np.arange(self.width), (self.height, 1)) - self.c.cx) * z / self.c.fx
         y = (np.tile(np.arange(self.height), (self.width, 1)).T - self.c.cy) * z / self.c.fy
@@ -360,10 +380,16 @@ class motion_estimator():
         return points, c2w
     
     def extract_pcd_by_indx(self,idx):
+        #################################################################
+        # Input: idx of the diff video (is different from colmap index!!!)
+        # ------------------------------------------------------------------------------
+        # Output: rescaled_rgbd = pointcloud in camera coord
+        #         c2w = matrix to pass to pcd.transform() to pass to world coords
+        #         colmap_kepoints = points of the reconstruction seen from the camera
         #Get Image Depth
         img_path = os.path.join(self.root_data,self.vid,"frames",self.epic_diff.image_paths[idx])
         img = cv2.imread(img_path)
-        #img = cv2.resize(img,(self.width,self.height))
+        img = cv2.resize(img,(self.width,self.height))
         depth = self.depth_est.depth_extractor(img,"niente")
 
         # Diff to COLMAP index translator
@@ -376,7 +402,9 @@ class motion_estimator():
         colmap_rgb = np.array([self.c.pts_Colmap[p3d].rgb for p3d in v.point3D_ids[v.point3D_ids > -1]]) #Absolute coordinates
 
         local_scale = self.new_scale_SfM_depth(depth, colmap_depths, colmap_coords)
-        rescaled_rgbd,c2w = self.obtain_rgbd2(depth, local_scale,v.tvec,v.qvec2rotmat())
+        c2w = 0
+        rescaled_rgbd= self.obtain_rgbd(depth, local_scale,v.tvec,v.qvec2rotmat())
+        #rescaled_rgbd,c2w = self.obtain_rgbd2(depth, local_scale,v.tvec,v.qvec2rotmat())
         return rescaled_rgbd, colmap_keypoints,colmap_rgb,c2w
     
     def draw_pcd(self,points,color=False):
@@ -387,11 +415,12 @@ class motion_estimator():
         #o3d.io.write_point_cloud("./data.ply", pcd)
         o3d.visualization.draw_geometries([pcd])
 
-    def compare_pcds(self,p1,p2,p2_color=None):
+    def compare_pcds(self,p1,c2w,p2,p2_color=None):
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(p1)
         red = np.tile(np.array([1,0,0]),(p1.shape[0],1))
         pcd.colors = o3d.utility.Vector3dVector(red)
+        pcd = pcd.transform(c2w)
 
         pcd2 = o3d.geometry.PointCloud()
         pcd2.points = o3d.utility.Vector3dVector(p2)
@@ -409,23 +438,31 @@ class motion_estimator():
             colmap_image=test_img,
             camera_height=EPIC_HEIGHT, camera_width=EPIC_WIDTH)
         return frustum
+
+    def segment_pcd(self):
+        for i, idx in enumerate(self.epic_diff.img_ids):
+            rescaled_rgbd, colmap_keypoints,colmap_rgb,c2w = self.extract_pcd_by_indx(idx)
 path  = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELDS/example_data/P01_01"
 
 root_data = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELDS/depth_extractor/data/Epic_converted"
-#c = COLMAP(path)
+
 vid = "P01_01"
 path_diff = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELDS/depth_extractor/data/Epic_converted"
 me = motion_estimator(root_data,path,path_diff,vid)
 idx = 285
 pcd_50, col_50_xyz,col_50_rgb,c2w = me.extract_pcd_by_indx(idx) #120 285 730 785
 p2_color = np.tile(np.array([0,0,1]),(col_50_xyz.shape[0],1)) #BLUE Color
-#me.compare_pcds(pcd_50,col_50_xyz,p2_color)
+#me.compare_pcds(pcd_50,c2w,col_50_xyz,p2_color)
 
 ##################################################################################################
-#compare with all the pointcloud
-#colmap_pcd_xyz = np.array([me.c.pts_Colmap[p3d].xyz for p3d in me.c.pts_Colmap.keys()])
+# Compare with all the pointcloud
+colmap_pcd_xyz = np.array([me.c.pts_Colmap[p3d].xyz for p3d in me.c.pts_Colmap.keys()])
 #colmap_pcd_rgb = np.array([me.c.pts_Colmap[p3d].rgb for p3d in me.c.pts_Colmap.keys()])
 
+#me.compare_pcds(pcd_50,c2w,colmap_pcd_xyz,p2_color)
+
+################################################################################################
+# Compare with .ply file (Dense pcd)
 path = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/DenseReconstruction/P01_01/fused.ply"
 pcd2 = o3d.io.read_point_cloud(path)
 
@@ -434,7 +471,7 @@ pcd = o3d.geometry.PointCloud()
 pcd.points = o3d.utility.Vector3dVector(p1)
 red = np.tile(np.array([1,0,0]),(p1.shape[0],1))
 pcd.colors = o3d.utility.Vector3dVector(red)
-pcd = pcd.transform(c2w)
+#pcd = pcd.transform(c2w)
 
 FOR =  get_o3d_FOR()
 frustum = me.get_frustum(idx)
