@@ -11,6 +11,8 @@ import depth_estimator as de
 import cv2
 from tqdm import tqdm
 
+
+import copy
 from hovering.o3d_line_mesh import LineMesh
 from scipy.spatial.distance import cdist
 
@@ -99,7 +101,52 @@ def convert_camera2world(points,R,t):
     
     return points_world  
 
+def get_pcd_statistics(pcd):
+        # Compute the average distance
+        distances = pcd.compute_point_cloud_distance()
+        avg_distance = np.mean(distances)
+        return avg_distance
 
+def compute_dist(p1,p2,th):
+    v1 = np.asarray(p1)
+    v2 = np.asarray(p2)
+    idx_list = np.array([],dtype=int)
+    for i in tqdm(range(v1.shape[0]),total=v1.shape[0]):
+        dist = cdist(np.expand_dims(v1[i,:],axis=0),v2,'euclidean')
+        _,c = np.where(dist < th)
+        c_unique = np.unique(c)
+        idx_list = np.concatenate((idx_list,c_unique))
+
+    idx_list_unique = np.unique(idx_list)
+    return idx_list_unique
+def dense_segment(dense_pcd,moving_pcd,th,first_time=True,path="data/Epic_converted/P01_01/pcds/indices.npy"):
+        ## Method 1
+        # dist = cdist(moving_pcd.points,dense_pcd.points,'euclidean')
+        # _,c = np.where(dist < th)
+        # c_unique = np.unique(c)
+        
+        #  Method 2
+        if(first_time):
+            c_unique = compute_dist(moving_pcd.points,dense_pcd.points,0.01)
+            np.save(path, c_unique)
+        else:
+            c_unique = np.load(path)
+            
+        dense_moving_pcd = o3d.geometry.PointCloud()
+        dense_static_pcd = o3d.geometry.PointCloud()
+
+        static_points = np.delete(np.asarray(dense_pcd.points), c_unique, axis=0)
+        static_colors = np.delete(np.asarray(dense_pcd.colors), c_unique, axis=0)
+
+        dense_points = np.asarray(dense_pcd.points)
+        dense_moving_pcd.points = o3d.utility.Vector3dVector(dense_points[c_unique])
+        dense_static_pcd.points = o3d.utility.Vector3dVector(static_points)
+        
+        red = o3d.utility.Vector3dVector(np.tile(np.array([1,0,0]),(len(c_unique),1)))
+        
+        dense_moving_pcd.colors = red
+        dense_static_pcd.colors = o3d.utility.Vector3dVector(static_colors)
+        return dense_moving_pcd, dense_static_pcd
 class EPICDiff(Dataset):
     def __init__(self, vid, root="data/EPIC-Diff", split=None):
 
@@ -458,6 +505,8 @@ class motion_estimator():
             camera_height=EPIC_HEIGHT, camera_width=EPIC_WIDTH)
         return frustum
 
+    
+     
     def segment_pcd(self,th):
         list_id = np.array([])
         print("Analysing points...")
@@ -483,8 +532,8 @@ class motion_estimator():
         static_path = os.path.join(self.pcd_path,"pcd_static.ply")
         if(load):
             
-            pcd_dyn = o3d.io.read_point_cloud(path)
-            pcd_static = o3d.io.read_point_cloud(path)
+            pcd_dyn = o3d.io.read_point_cloud(dyn_path)
+            pcd_static = o3d.io.read_point_cloud(static_path)
         else:
             threshold = 2
             #Getting id of moving objects
@@ -500,50 +549,53 @@ class motion_estimator():
             o3d.io.write_point_cloud(static_path,pcd_static)
             o3d.io.write_point_cloud(dyn_path,pcd_dyn)
         return pcd_static,pcd_dyn
+###############################################################################
+## Main segment run
+#path  = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELDS/example_data/P01_01"
+#root_data = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELDS/depth_extractor/data/Epic_converted"
+#vid = "P01_01"
+#path_diff = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELDS/depth_extractor/data/Epic_converted"
+#me = motion_estimator(root_data,path,path_diff,vid)
+#
+#pcd_static, pcd_moving = me.segment_run(load=True)
+#o3d.visualization.draw_geometries([pcd_static,pcd_moving])
+###################################################################################################
+# See segmentation results
+path_dense = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/DenseReconstruction/P01_01/fused.ply"
+path_dyn = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELDS/depth_extractor/data/Epic_converted/P01_01/pcds/pcd_dyn.ply"
+pcd_dense = o3d.io.read_point_cloud(path_dense)
+pcd_dyn = o3d.io.read_point_cloud(path_dyn)
 
-path  = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELDS/example_data/P01_01"
-
-root_data = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELDS/depth_extractor/data/Epic_converted"
-
-vid = "P01_01"
-path_diff = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELDS/depth_extractor/data/Epic_converted"
-me = motion_estimator(root_data,path,path_diff,vid)
-
-pcd_static, pcd_moving = me.segment_run(load=True)
-o3d.visualization.draw_geometries([pcd_static,pcd_moving])
-##################################################################################################
-# Extract pcd from a single frame
-idx = 285
-pcd_50, col_50_xyz,col_50_rgb,_ = me.extract_pcd_by_indx(idx) #120 285 730 785
-pcd_50 = me.mask_rgbd(idx,pcd_50)
-p2_color = np.tile(np.array([0,0,1]),(col_50_xyz.shape[0],1)) #BLUE Color
-me.compare_pcds(pcd_50,col_50_xyz,p2_color)
-
-
-##################################################################################################
-# Compare with all the pointcloud
-colmap_pcd_xyz = np.array([me.c.pts_Colmap[p3d].xyz for p3d in me.c.pts_Colmap.keys()])
-#colmap_pcd_rgb = np.array([me.c.pts_Colmap[p3d].rgb for p3d in me.c.pts_Colmap.keys()])
-
-me.compare_pcds(pcd_50,colmap_pcd_xyz,p2_color)
-
-################################################################################################
-# Compare with .ply file (Dense pcd)
-path = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/DenseReconstruction/P01_01/fused.ply"
-pcd2 = o3d.io.read_point_cloud(path)
-
-p1 = pcd_50
-pcd = o3d.geometry.PointCloud()
-pcd.points = o3d.utility.Vector3dVector(p1)
-red = np.tile(np.array([1,0,0]),(p1.shape[0],1))
-pcd.colors = o3d.utility.Vector3dVector(red)
-
-FOR =  get_o3d_FOR()
-frustum = me.get_frustum(idx)
-o3d.visualization.draw_geometries([pcd,pcd2,FOR,frustum])
-
-########################################################################
-# Segment everything moving
-threshold = 2
-moving_indx = me.segment_pcd(threshold)
+dense_moving_pcd,dense_static_pcd = dense_segment(pcd_dense,pcd_dyn,0.02,first_time=True)
+o3d.visualization.draw_geometries([dense_static_pcd])
+###################################################################################################
+## Extract pcd from a single frame
+#idx = 285
+#pcd_50, col_50_xyz,col_50_rgb,_ = me.extract_pcd_by_indx(idx) #120 285 730 785
+#pcd_50 = me.mask_rgbd(idx,pcd_50)
+#p2_color = np.tile(np.array([0,0,1]),(col_50_xyz.shape[0],1)) #BLUE Color
+#me.compare_pcds(pcd_50,col_50_xyz,p2_color)
+#
+#
+###################################################################################################
+## Compare with all the pointcloud
+#colmap_pcd_xyz = np.array([me.c.pts_Colmap[p3d].xyz for p3d in me.c.pts_Colmap.keys()])
+#
+#me.compare_pcds(pcd_50,colmap_pcd_xyz,p2_color)
+#
+#################################################################################################
+## Compare with .ply file (Dense pcd)
+#path = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/DenseReconstruction/P01_01/fused.ply"
+#pcd2 = o3d.io.read_point_cloud(path)
+#
+#p1 = pcd_50
+#pcd = o3d.geometry.PointCloud()
+#pcd.points = o3d.utility.Vector3dVector(p1)
+#red = np.tile(np.array([1,0,0]),(p1.shape[0],1))
+#pcd.colors = o3d.utility.Vector3dVector(red)
+#
+#FOR =  get_o3d_FOR()
+#frustum = me.get_frustum(idx)
+#o3d.visualization.draw_geometries([pcd,pcd2,FOR,frustum])
+#
 print("Ciao")
