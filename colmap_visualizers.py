@@ -9,8 +9,10 @@ import matplotlib.pyplot as plt
 import json
 import depth_estimator as de
 import cv2
+from tqdm import tqdm
 
 from hovering.o3d_line_mesh import LineMesh
+from scipy.spatial.distance import cdist
 
 EPIC_WIDTH = 456
 EPIC_HEIGHT = 256
@@ -322,6 +324,7 @@ class motion_estimator():
     def __init__(self,root_data,path_col,path_diff,vid) -> None:
         self.root_data = root_data
         self.vid = vid
+        self.pcd_path = os.path.join(self.root_data,self.vid,"pcds")
         self.c = COLMAP(path_col)#,output_res=[456,256])
         self.epic_diff = EPICDiff(vid,path_diff)
         self.depth_est = de.Inference()
@@ -379,13 +382,19 @@ class motion_estimator():
         
         return points, c2w
     
+    def diff2Col(self,idx):
+        try:
+            col_idx = [self.c.imgs_Colmap[i].id for i in self.c.imgs_Colmap.keys() if self.c.imgs_Colmap[i].name == self.epic_diff.image_paths[idx]]
+        except:
+            col_idx = np.array([-1,0])
+        return col_idx[0]
     def extract_pcd_by_indx(self,idx):
         #################################################################
         # Input: idx of the diff video (is different from colmap index!!!)
         # ------------------------------------------------------------------------------
-        # Output: rescaled_rgbd = pointcloud in camera coord
-        #         c2w = matrix to pass to pcd.transform() to pass to world coords
-        #         colmap_kepoints = points of the reconstruction seen from the camera
+        # Output: rescaled_rgbd = pointcloud in world coord
+        #         
+        #         colmap_keypoints = points of the reconstruction seen from the camera
         #Get Image Depth
         img_path = os.path.join(self.root_data,self.vid,"frames",self.epic_diff.image_paths[idx])
         img = cv2.imread(img_path)
@@ -393,20 +402,31 @@ class motion_estimator():
         depth = self.depth_est.depth_extractor(img,"niente")
 
         # Diff to COLMAP index translator
-        col_idx = [self.c.imgs_Colmap[i].id for i in self.c.imgs_Colmap.keys() if self.c.imgs_Colmap[i].name == self.epic_diff.image_paths[idx]]
+        col_idx = self.diff2Col(idx)
+    
         #Get corresponding colmap depth
-        v = self.c.imgs_Colmap[col_idx[0]]
+        v = self.c.imgs_Colmap[col_idx]
         colmap_depths = np.array([(v.qvec2rotmat() @ self.c.pts_Colmap[p3d].xyz + v.tvec)[2] for p3d in v.point3D_ids[v.point3D_ids > -1]]) #WE PASS TO CAMERA COORDINATES
         colmap_coords = np.array([v.xys[np.where(v.point3D_ids == p3d)][0, ::-1] for p3d in v.point3D_ids[v.point3D_ids > -1]]) #Depth of the keypoints in the camera coordinates
         colmap_keypoints = np.array([self.c.pts_Colmap[p3d].xyz for p3d in v.point3D_ids[v.point3D_ids > -1]]) #Absolute coordinates
         colmap_rgb = np.array([self.c.pts_Colmap[p3d].rgb for p3d in v.point3D_ids[v.point3D_ids > -1]]) #Absolute coordinates
-
+        colmap_ids = np.array([p3d for p3d in v.point3D_ids[v.point3D_ids > -1]])
+        
         local_scale = self.new_scale_SfM_depth(depth, colmap_depths, colmap_coords)
-        c2w = 0
         rescaled_rgbd= self.obtain_rgbd(depth, local_scale,v.tvec,v.qvec2rotmat())
-        #rescaled_rgbd,c2w = self.obtain_rgbd2(depth, local_scale,v.tvec,v.qvec2rotmat())
-        return rescaled_rgbd, colmap_keypoints,colmap_rgb,c2w
-    
+        moving_rgbd = self.mask_rgbd(idx,rescaled_rgbd)
+
+
+        return rescaled_rgbd, colmap_keypoints,colmap_rgb,colmap_ids
+    def mask_rgbd(self,idx,rgbd):
+        mask_path = self.root_data+"/"+self.vid+"/single_masks/static/static_"+str(idx)+".png"
+        mask_img = cv2.imread(mask_path,cv2.IMREAD_GRAYSCALE)
+        mask_img = cv2.resize(mask_img,(self.width,self.height))
+        mask_img = 1-mask_img
+        mask_img = mask_img.reshape((self.width*self.height,))
+        points = rgbd[mask_img>60,:]
+        return points
+
     def draw_pcd(self,points,color=False):
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points)
@@ -415,12 +435,11 @@ class motion_estimator():
         #o3d.io.write_point_cloud("./data.ply", pcd)
         o3d.visualization.draw_geometries([pcd])
 
-    def compare_pcds(self,p1,c2w,p2,p2_color=None):
+    def compare_pcds(self,p1,p2,p2_color=None):
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(p1)
         red = np.tile(np.array([1,0,0]),(p1.shape[0],1))
         pcd.colors = o3d.utility.Vector3dVector(red)
-        pcd = pcd.transform(c2w)
 
         pcd2 = o3d.geometry.PointCloud()
         pcd2.points = o3d.utility.Vector3dVector(p2)
@@ -439,9 +458,49 @@ class motion_estimator():
             camera_height=EPIC_HEIGHT, camera_width=EPIC_WIDTH)
         return frustum
 
-    def segment_pcd(self):
-        for i, idx in enumerate(self.epic_diff.img_ids):
-            rescaled_rgbd, colmap_keypoints,colmap_rgb,c2w = self.extract_pcd_by_indx(idx)
+    def segment_pcd(self,th):
+        list_id = np.array([])
+        print("Analysing points...")
+        for i, idx in tqdm(enumerate(self.epic_diff.img_ids),total=1000):
+            if(self.diff2Col(idx) > 0): # se esiste il corrispondente in colmap
+                rescaled_rgbd, colmap_keypoints,_,colmap_ids = self.extract_pcd_by_indx(idx)
+                moving_rgbd = self.mask_rgbd(idx,rescaled_rgbd)
+
+                dist = cdist(moving_rgbd,colmap_keypoints,'euclidean')
+
+                _,c = np.where(dist < th)
+                c_unique = np.unique(c)
+                lower_ids = colmap_ids[c_unique] 
+                list_id = np.concatenate((list_id, lower_ids))
+            
+
+        points_id = np.array(list_id)
+        points_id = np.unique(points_id)
+        return points_id
+
+    def segment_run(self,load=False):
+        dyn_path = os.path.join(self.pcd_path,"pcd_dyn.ply")
+        static_path = os.path.join(self.pcd_path,"pcd_static.ply")
+        if(load):
+            
+            pcd_dyn = o3d.io.read_point_cloud(path)
+            pcd_static = o3d.io.read_point_cloud(path)
+        else:
+            threshold = 2
+            #Getting id of moving objects
+            points_id = self.segment_pcd(threshold)
+
+            pcd_dyn = o3d.geometry.PointCloud()
+            pcd_dyn.points = o3d.utility.Vector3dVector([self.c.pts_Colmap[p3d].xyz for p3d in points_id])
+            pcd_dyn.colors = o3d.utility.Vector3dVector(np.tile(np.array([1,0,0]),(len(points_id),1)))
+            pcd_static = o3d.geometry.PointCloud()
+            pcd_static.points = o3d.utility.Vector3dVector([self.c.pts_Colmap[p3d].xyz for p3d in self.c.pts_Colmap if p3d not in points_id])
+            pcd_static.colors = o3d.utility.Vector3dVector(np.tile(np.array([0,0,1]),(len(pcd_static.points),1)))
+            #Save file
+            o3d.io.write_point_cloud(static_path,pcd_static)
+            o3d.io.write_point_cloud(dyn_path,pcd_dyn)
+        return pcd_static,pcd_dyn
+
 path  = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELDS/example_data/P01_01"
 
 root_data = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELDS/depth_extractor/data/Epic_converted"
@@ -449,17 +508,24 @@ root_data = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELD
 vid = "P01_01"
 path_diff = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELDS/depth_extractor/data/Epic_converted"
 me = motion_estimator(root_data,path,path_diff,vid)
+
+pcd_static, pcd_moving = me.segment_run(load=True)
+o3d.visualization.draw_geometries([pcd_static,pcd_moving])
+##################################################################################################
+# Extract pcd from a single frame
 idx = 285
-pcd_50, col_50_xyz,col_50_rgb,c2w = me.extract_pcd_by_indx(idx) #120 285 730 785
+pcd_50, col_50_xyz,col_50_rgb,_ = me.extract_pcd_by_indx(idx) #120 285 730 785
+pcd_50 = me.mask_rgbd(idx,pcd_50)
 p2_color = np.tile(np.array([0,0,1]),(col_50_xyz.shape[0],1)) #BLUE Color
-#me.compare_pcds(pcd_50,c2w,col_50_xyz,p2_color)
+me.compare_pcds(pcd_50,col_50_xyz,p2_color)
+
 
 ##################################################################################################
 # Compare with all the pointcloud
 colmap_pcd_xyz = np.array([me.c.pts_Colmap[p3d].xyz for p3d in me.c.pts_Colmap.keys()])
 #colmap_pcd_rgb = np.array([me.c.pts_Colmap[p3d].rgb for p3d in me.c.pts_Colmap.keys()])
 
-#me.compare_pcds(pcd_50,c2w,colmap_pcd_xyz,p2_color)
+me.compare_pcds(pcd_50,colmap_pcd_xyz,p2_color)
 
 ################################################################################################
 # Compare with .ply file (Dense pcd)
@@ -471,11 +537,13 @@ pcd = o3d.geometry.PointCloud()
 pcd.points = o3d.utility.Vector3dVector(p1)
 red = np.tile(np.array([1,0,0]),(p1.shape[0],1))
 pcd.colors = o3d.utility.Vector3dVector(red)
-#pcd = pcd.transform(c2w)
 
 FOR =  get_o3d_FOR()
 frustum = me.get_frustum(idx)
 o3d.visualization.draw_geometries([pcd,pcd2,FOR,frustum])
 
-
+########################################################################
+# Segment everything moving
+threshold = 2
+moving_indx = me.segment_pcd(threshold)
 print("Ciao")
