@@ -12,7 +12,9 @@ import cv2
 from tqdm import tqdm
 
 
+from datetime import datetime
 import copy
+import argparse
 from hovering.o3d_line_mesh import LineMesh
 from scipy.spatial.distance import cdist
 
@@ -119,16 +121,16 @@ def compute_dist(p1,p2,th):
 
     idx_list_unique = np.unique(idx_list)
     return idx_list_unique
-def dense_segment(dense_pcd,moving_pcd,th,first_time=True,path="data/Epic_converted/P01_01/pcds/indices.npy"):
+def dense_segment(dense_pcd,moving_pcd,th=0.02,first_time=True,path="data/Epic_converted/P01_01/pcds/indices.npy"):
         ## Method 1
         # dist = cdist(moving_pcd.points,dense_pcd.points,'euclidean')
         # _,c = np.where(dist < th)
         # c_unique = np.unique(c)
         
-        #  Method 2
+        #  Method 2 #TODO check to save the indices if it make sense...
         if(first_time):
-            c_unique = compute_dist(moving_pcd.points,dense_pcd.points,0.01)
-            np.save(path, c_unique)
+            c_unique = compute_dist(moving_pcd.points,dense_pcd.points,th)
+            #np.save(path, c_unique)
         else:
             c_unique = np.load(path)
             
@@ -368,12 +370,12 @@ class COLMAP(Dataset):
   
 
 class motion_estimator():
-    def __init__(self,root_data,path_col,path_diff,vid) -> None:
+    def __init__(self,root_data,path_col,vid) -> None:
         self.root_data = root_data
         self.vid = vid
         self.pcd_path = os.path.join(self.root_data,self.vid,"pcds")
         self.c = COLMAP(path_col)#,output_res=[456,256])
-        self.epic_diff = EPICDiff(vid,path_diff)
+        self.epic_diff = EPICDiff(vid,root_data)
         self.depth_est = de.Inference()
         self.width = 228
         self.height = 128
@@ -505,8 +507,6 @@ class motion_estimator():
             camera_height=EPIC_HEIGHT, camera_width=EPIC_WIDTH)
         return frustum
 
-    
-     
     def segment_pcd(self,th):
         list_id = np.array([])
         print("Analysing points...")
@@ -527,15 +527,13 @@ class motion_estimator():
         points_id = np.unique(points_id)
         return points_id
 
-    def segment_run(self,load=False):
-        dyn_path = os.path.join(self.pcd_path,"pcd_dyn.ply")
-        static_path = os.path.join(self.pcd_path,"pcd_static.ply")
+    def segment_run(self,load=False,threshold=2):
+        dyn_path = os.path.join(self.pcd_path,"pcd_dyn_th_"+str(threshold)+".ply")
+        static_path = os.path.join(self.pcd_path,"pcd_static_th_"+str(threshold)+".ply")
         if(load):
-            
             pcd_dyn = o3d.io.read_point_cloud(dyn_path)
             pcd_static = o3d.io.read_point_cloud(static_path)
         else:
-            threshold = 2
             #Getting id of moving objects
             points_id = self.segment_pcd(threshold)
 
@@ -549,26 +547,55 @@ class motion_estimator():
             o3d.io.write_point_cloud(static_path,pcd_static)
             o3d.io.write_point_cloud(dyn_path,pcd_dyn)
         return pcd_static,pcd_dyn
-###############################################################################
-## Main segment run
+
+def run(input_args):
+    root_data=input_args.root
+    vid=input_args.vid
+    project_path = os.path.join(root_data,vid)
+    colmap_path=os.path.join(project_path,"colmap")
+    distance_th = input_args.threshold_dist
+    segment_th = input_args.segment_th
+
+    
+
+    current_datetime= datetime.now().strftime('%Y-%m-%d__%H-%M')
+    folder_name = os.path.join(project_path,"results",current_datetime)
+    if(input_args.operation=="Segment"):
+        me = motion_estimator(root_data,colmap_path,vid)
+        me.segment_run(load=False,threshold=segment_th)
+    elif(input_args.operation=="Dense"):
+        path_dense = os.path.join(project_path,"colmap","fused.ply")
+        path_dyn = os.path.join(project_path,"pcds/pcd_dyn.ply") #TODO adjust me
+        pcd_dense = o3d.io.read_point_cloud(path_dense)
+        pcd_dyn = o3d.io.read_point_cloud(path_dyn)
+
+        dense_moving_pcd,dense_static_pcd = dense_segment(pcd_dense,pcd_dyn,distance_th,first_time=True,)
+        dist_str = str(distance_th).replace('.', '-')
+        static_path = os.path.join(project_path,"pcds","static_dense_pcd_th_"+dist_str+".ply")
+        dyn_path = os.path.join(project_path,"pcds","dyn_dense_pcd_th_"+dist_str+".ply")
+        o3d.io.write_point_cloud(static_path ,dense_static_pcd)
+        o3d.io.write_point_cloud(dyn_path ,dense_moving_pcd)
+    
+################################################################################
+### Main segment run
 #path  = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELDS/example_data/P01_01"
 #root_data = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELDS/depth_extractor/data/Epic_converted"
 #vid = "P01_01"
 #path_diff = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELDS/depth_extractor/data/Epic_converted"
-#me = motion_estimator(root_data,path,path_diff,vid)
-#
-#pcd_static, pcd_moving = me.segment_run(load=True)
-#o3d.visualization.draw_geometries([pcd_static,pcd_moving])
-###################################################################################################
-# See segmentation results
-path_dense = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/DenseReconstruction/P01_01/fused.ply"
-path_dyn = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/CodiceEPICFIELDS/depth_extractor/data/Epic_converted/P01_01/pcds/pcd_dyn.ply"
-pcd_dense = o3d.io.read_point_cloud(path_dense)
-pcd_dyn = o3d.io.read_point_cloud(path_dyn)
+#me = motion_estimator(root_data,path,vid)
+##
+##pcd_static, pcd_moving = me.segment_run(load=True)
+##o3d.visualization.draw_geometries([pcd_static,pcd_moving])
+####################################################################################################
+## See segmentation results
+#path_dense = "/Users/francesco/Desktop/Università/Tesi/EgoChiara/DenseReconstruction/P01_01/fused.ply"
+#path_dyn = "data/Epic_converted/P01_01/pcds/pcd_dyn.ply"
+#pcd_dense = o3d.io.read_point_cloud(path_dense)
+#pcd_dyn = o3d.io.read_point_cloud(path_dyn)#
 
-dense_moving_pcd,dense_static_pcd = dense_segment(pcd_dense,pcd_dyn,0.02,first_time=True)
-o3d.visualization.draw_geometries([dense_static_pcd])
-###################################################################################################
+#dense_moving_pcd,dense_static_pcd = dense_segment(pcd_dense,pcd_dyn,0.02,first_time=True)
+#o3d.visualization.draw_geometries([dense_static_pcd])
+####################################################################################################
 ## Extract pcd from a single frame
 #idx = 285
 #pcd_50, col_50_xyz,col_50_rgb,_ = me.extract_pcd_by_indx(idx) #120 285 730 785
@@ -598,4 +625,28 @@ o3d.visualization.draw_geometries([dense_static_pcd])
 #frustum = me.get_frustum(idx)
 #o3d.visualization.draw_geometries([pcd,pcd2,FOR,frustum])
 #
-print("Ciao")
+def init_parser(root="data/Epic_converted"):
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--root", type=str, default=root, help="Root directory of dataset."
+    )
+    parser.add_argument(
+        "--vid", type=str, help="Video Id: es P01_01"
+    )
+    parser.add_argument(
+        "--operation", type=str, help="Possible: All/Segment/Dense"
+    )
+    parser.add_argument(
+        "--threshold_dist", type=float, help="Distance for Dense Distance"
+    )
+    parser.add_argument(
+        "--segment_th", type=float, help="Distance threshold during segmentation"
+    )
+
+    input_args,unknown = parser.parse_known_args()
+    
+    return input_args
+if __name__=='__main__':
+    input_args = init_parser()
+    run(input_args)
