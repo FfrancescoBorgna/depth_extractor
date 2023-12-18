@@ -20,7 +20,7 @@ for val in "${th_values[@]}"; do
   --vid "P01_01" \
   --operation "Dense" \
   --threshold_dist $val \
-  --segment_th 2 \
+  --segment_th 2 
 done
 
 
