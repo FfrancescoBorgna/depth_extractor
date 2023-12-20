@@ -3,3 +3,4 @@ data
 __pycache__
 .gitignore.save
 prove
+data_tiche
